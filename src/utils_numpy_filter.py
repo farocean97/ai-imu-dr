@@ -4,7 +4,7 @@ np.set_printoptions(precision=2)
 import scipy.linalg
 from termcolor import cprint
 from utils import *
-
+from tqdm import tqdm
 
 class NUMPYIEKF:
     Id2 = np.eye(2)
@@ -115,14 +115,18 @@ class NUMPYIEKF:
                            self.cov_Rot_c_i, self.cov_Rot_c_i, self.cov_Rot_c_i,
                            self.cov_t_c_i, self.cov_t_c_i, self.cov_t_c_i])
 
-    def run(self, t, u, measurements_covs, v_mes, p_mes, N, ang0):
+    def run(self, t, u, measurements_covs, v_mes, p_mes, N, ang0, p4h_params=None):
         dt = t[1:] - t[:-1]  # (s)
         if N is None:
             N = u.shape[0]
-        Rot, v, p, b_omega, b_acc, Rot_c_i, t_c_i, P = self.init_run(dt, u, p_mes, v_mes,
-                                       ang0, N)
+        if p4h_params is not None:
+            Rot, v, p, b_omega, b_acc, Rot_c_i, t_c_i, P = self.init_p4h_run(dt, u, p_mes, v_mes,
+                                       ang0, N, p4h_params)
+        else:
+            Rot, v, p, b_omega, b_acc, Rot_c_i, t_c_i, P = self.init_run(dt, u, p_mes, v_mes,
+                                        ang0, N)
 
-        for i in range(1, N):
+        for i in tqdm(range(1, N)):
             Rot[i], v[i], p[i], b_omega[i], b_acc[i], Rot_c_i[i], t_c_i[i], P = \
                 self.propagate(Rot[i-1], v[i-1], p[i-1], b_omega[i-1], b_acc[i-1], Rot_c_i[i-1],
                                t_c_i[i-1], P, u[i], dt[i-1])
@@ -136,6 +140,30 @@ class NUMPYIEKF:
             # correct numerical error every 10 seconds
             if i % self.n_normalize_rot_c_i == 0:
                 Rot_c_i[i] = self.normalize_rot(Rot_c_i[i])
+        return Rot, v, p, b_omega, b_acc, Rot_c_i, t_c_i
+
+    def init_p4h_run(self, dt, u, p_mes, v_mes, ang0, N, p4h_params):
+        Rot, v, p, b_omega, b_acc, Rot_c_i, t_c_i = self.init_p4h_saved_state(dt, N, ang0, p4h_params)
+        Rot[0] = self.from_rpy(ang0[0], ang0[1], ang0[2])
+        v[0] = v_mes[0]
+        P = self.init_covariance()
+        return Rot, v, p, b_omega, b_acc, Rot_c_i, t_c_i, P
+
+    def init_p4h_saved_state(self, dt, N, ang0, p4h_params):
+        Rot = np.zeros((N, 3, 3))
+        v = np.zeros((N, 3))
+        p = np.zeros((N, 3))
+        b_omega = np.zeros((N, 3))
+        b_acc = np.zeros((N, 3))
+        Rot_c_i = np.zeros((N, 3, 3))
+        t_c_i = np.zeros((N, 3))
+
+        Rot[0] = p4h_params['R_LI']
+        v[0] = p4h_params['v_LI_L']
+        p[0] = p4h_params['p_LI_L']
+
+        Rot_c_i[0] = p4h_params['T_VI'][:3, :3]
+        t_c_i[0] = p4h_params['T_VI'][:3, 3]
         return Rot, v, p, b_omega, b_acc, Rot_c_i, t_c_i
 
     def init_run(self, dt, u, p_mes, v_mes, ang0, N):
