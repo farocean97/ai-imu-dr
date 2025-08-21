@@ -727,9 +727,12 @@ class TORCHIEKF(torch.nn.Module, NUMPYIEKF):
         # Irrespective of the original strides, the returned matrix U will
         # be transposed, i.e. with strides (1, n) instead of (n, 1).
 
+        # Get the device of the input tensor
+        device = rot.device
+        
         # pytorch SVD seems to be inaccurate, so just move to numpy immediately
         U, _, V = torch.svd(rot)
-        S = torch.eye(3).double()
+        S = torch.eye(3, device=device).double()
         S[2, 2] = torch.det(U) * torch.det(V)
         return U.mm(S).mm(V.t())
 

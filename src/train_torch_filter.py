@@ -39,7 +39,7 @@ def compute_delta_p(Rot: torch.Tensor, p: torch.Tensor) -> List[list]:
     """
     list_rpe = [[], [], []]  # [idx_0, idx_end, pose_delta_p]
 
-    # sample at 1 Hz
+    # sample at 10 Hz (100Hz to 10Hz)
     Rot = Rot[::10]
     p = p[::10]
 
@@ -116,6 +116,17 @@ def prepare_filter(args: object, dataset: object) -> TORCHIEKF:
     iekf.train()
     # init u_loc and u_std
     iekf.get_normalize_u(dataset)
+    
+    # Move model to GPU if available and enabled
+    if hasattr(args, 'use_gpu') and args.use_gpu and torch.cuda.is_available():
+        device = torch.device('cuda')
+        iekf = iekf.to(device)
+        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        device = torch.device('cpu')
+        print("Using CPU")
+    
+    iekf.device = device
     return iekf
 
 
@@ -169,7 +180,7 @@ def prepare_loss_data(args: object, dataset: object) -> None:
     list_rpe_ = copy.deepcopy(list_rpe)
     dataset.list_rpe = {}
     for dataset_name, rpe in list_rpe_.items():
-        if len(rpe[0]) is not 0:
+        if len(rpe[0]) != 0:
             dataset.list_rpe[dataset_name] = list_rpe[dataset_name]
         else:
             dataset.datasets_train_filter.pop(dataset_name)
@@ -179,7 +190,7 @@ def prepare_loss_data(args: object, dataset: object) -> None:
     list_rpe_validation_ = copy.deepcopy(list_rpe_validation)
     dataset.list_rpe_validation = {}
     for dataset_name, rpe in list_rpe_validation_.items():
-        if len(rpe[0]) is not 0:
+        if len(rpe[0]) != 0:
             dataset.list_rpe_validation[dataset_name] = list_rpe_validation[dataset_name]
         else:
             dataset.datasets_validatation_filter.pop(dataset_name)
@@ -215,7 +226,7 @@ def train_loop(args: object, dataset: object, epoch: int, iekf: TORCHIEKF, optim
         loss = mini_batch_step(dataset, dataset_name, iekf,
                                dataset.list_rpe[dataset_name], t, ang_gt, p_gt, v_gt, u, N0)
 
-        if loss is -1 or torch.isnan(loss):
+        if loss == -1 or torch.isnan(loss):
             cprint("{} loss is invalid".format(i), 'yellow')
             continue
         elif loss > max_loss:
@@ -227,7 +238,7 @@ def train_loop(args: object, dataset: object, epoch: int, iekf: TORCHIEKF, optim
 
     if loss_train == 0: 
         return 
-    loss_train.backward()  # loss_train.cuda().backward()  
+    loss_train.backward()
     g_norm = torch.nn.utils.clip_grad_norm_(iekf.parameters(), max_grad_norm)
     if np.isnan(g_norm) or g_norm > 3*max_grad_norm:
         cprint("gradient norm: {:.5f}".format(g_norm), 'yellow')
@@ -237,7 +248,7 @@ def train_loop(args: object, dataset: object, epoch: int, iekf: TORCHIEKF, optim
         optimizer.step()
         optimizer.zero_grad()
         cprint("gradient norm: {:.5f}".format(g_norm))
-    print('Train Epoch: {:2d} \tLoss: {:.5f}'.format(epoch, loss_train))
+    print('Train Epoch: {:2d} \tLoss: {:.5f}'.format(epoch, loss_train.item()))
     return loss_train
 
 
@@ -250,7 +261,15 @@ def save_iekf(args: object, iekf: TORCHIEKF) -> None:
         iekf: The TORCHIEKF model to save
     """
     file_name = os.path.join(args.path_temp, "iekfnets.p")
-    torch.save(iekf.state_dict(), file_name)
+    
+    # Save the model to CPU to ensure compatibility when loading on different devices
+    if hasattr(iekf, 'device') and iekf.device.type == 'cuda':
+        # Create a copy of the state dict with tensors on CPU
+        cpu_state_dict = {k: v.cpu() for k, v in iekf.state_dict().items()}
+        torch.save(cpu_state_dict, file_name)
+    else:
+        torch.save(iekf.state_dict(), file_name)
+    
     print("The IEKF nets are saved in the file " + file_name)
 
 
@@ -275,11 +294,20 @@ def mini_batch_step(dataset: object, dataset_name: str, iekf: TORCHIEKF, list_rp
     Returns:
         loss: Loss value for this mini-batch (scalar tensor) or -1 if invalid
     """
+    # Move data to the appropriate device if not already there
+    device = iekf.device if hasattr(iekf, 'device') else torch.device('cpu')
+    
+    t = t.to(device)
+    ang_gt = ang_gt.to(device)
+    p_gt = p_gt.to(device)
+    v_gt = v_gt.to(device)
+    u = u.to(device)
+    
     iekf.set_Q()
     measurements_covs = iekf.forward_nets(u)
-    Rot, v, p, b_omega, b_acc, Rot_c_i, t_c_i = iekf.run(t, u,measurements_covs,
-                                                            v_gt, p_gt, t.shape[0],
-                                                            ang_gt[0])
+    Rot, v, p, b_omega, b_acc, Rot_c_i, t_c_i = iekf.run(t, u, measurements_covs,
+                                                          v_gt, p_gt, t.shape[0],
+                                                          ang_gt[0])
     delta_p, delta_p_gt = precompute_lost(Rot, p, list_rpe, N0)
     if delta_p is None:
         return -1
@@ -329,15 +357,15 @@ def prepare_data_filter(dataset: object, dataset_name: str, Ns: list,
         u: IMU measurements with shape (seq_length, 6) [gyro_x, gyro_y, gyro_z, acc_x, acc_y, acc_z]
         N0: Starting index in the sequence
     """
-    # get data with trainable instant
-    t, ang_gt, p_gt, v_gt,  u = dataset.get_data(dataset_name)
+    # Get data with trainable instant
+    t, ang_gt, p_gt, v_gt, u = dataset.get_data(dataset_name)
     t = t[Ns[0]: Ns[1]]
     ang_gt = ang_gt[Ns[0]: Ns[1]]
     p_gt = p_gt[Ns[0]: Ns[1]] - p_gt[Ns[0]]
     v_gt = v_gt[Ns[0]: Ns[1]]
     u = u[Ns[0]: Ns[1]]
 
-    # subsample data
+    # Subsample data
     N0, N = get_start_and_end(seq_dim, u)
     t = t[N0: N].double()
     ang_gt = ang_gt[N0: N].double()
@@ -345,9 +373,12 @@ def prepare_data_filter(dataset: object, dataset_name: str, Ns: list,
     v_gt = v_gt[N0: N].double()
     u = u[N0: N].double()
 
-    # add noise
+    # Add noise
     if iekf.mes_net.training:
         u = dataset.add_noise(u)
+    
+    # We'll move tensors to the device at the mini_batch_step level
+    # to avoid moving tensors back and forth between CPU and GPU
 
     return t, ang_gt, p_gt, v_gt, u, N0
 
@@ -388,20 +419,24 @@ def precompute_lost(Rot: torch.Tensor, p: torch.Tensor, list_rpe: list, N0: int)
         delta_p_gt: Normalized ground truth relative positions with shape (num_valid_samples, 3)
         or (None, None) if no valid samples are found
     """
+    device = Rot.device
     N = p.shape[0]
     Rot_10_Hz = Rot[::10]
     p_10_Hz = p[::10]
-    idxs_0 = torch.Tensor(list_rpe[0]).clone().long() - int(N0 / 10)
-    idxs_end = torch.Tensor(list_rpe[1]).clone().long() - int(N0 / 10)
-    delta_p_gt = list_rpe[2]
-    idxs = torch.Tensor(idxs_0.shape[0]).byte()
-    idxs[:] = 1
-    idxs[idxs_0 < 0] = 0
-    idxs[idxs_end >= int(N / 10)] = 0
+    
+    idxs_0 = torch.tensor(list_rpe[0], device=device).clone().long() - int(N0 / 10)
+    idxs_end = torch.tensor(list_rpe[1], device=device).clone().long() - int(N0 / 10)
+    delta_p_gt = torch.tensor(list_rpe[2], device=device) if not isinstance(list_rpe[2], torch.Tensor) else list_rpe[2].to(device)
+    
+    idxs = torch.ones(idxs_0.shape[0], dtype=torch.bool, device=device)
+    idxs[idxs_0 < 0] = False
+    idxs[idxs_end >= int(N / 10)] = False
+    
     delta_p_gt = delta_p_gt[idxs]
     idxs_end_bis = idxs_end[idxs]
     idxs_0_bis = idxs_0[idxs]
-    if len(idxs_0_bis) is 0: 
+    
+    if len(idxs_0_bis) == 0: 
         return None, None     
     else:
         delta_p = Rot_10_Hz[idxs_0_bis].transpose(-1, -2).matmul(

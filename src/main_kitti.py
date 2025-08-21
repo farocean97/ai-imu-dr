@@ -481,10 +481,27 @@ class KITTIArgs():
         results_filter = 1
         dataset_class = KITTIDataset
         parameter_class = KITTIParameters
+        
+        # device selection (True for GPU, False for CPU)
+        use_gpu = torch.cuda.is_available()
 
 
 if __name__ == '__main__':
+    import argparse
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='AI-IMU Dead-Reckoning')
+    parser.add_argument('--no-gpu', action='store_true', help='Disable GPU usage even if available')
+    parsed_args = parser.parse_args()
+    
+    # Initialize KITTIArgs
     args = KITTIArgs()
+    
+    # Override GPU usage if explicitly disabled via command line
+    if parsed_args.no_gpu:
+        args.use_gpu = False
+        print("GPU usage disabled via command line")
+    
     dataset = KITTIDataset(args)
-    launch(KITTIArgs)
+    launch(args)
 
