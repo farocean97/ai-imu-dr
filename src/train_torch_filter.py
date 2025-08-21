@@ -7,6 +7,7 @@ from termcolor import cprint
 from utils_torch_filter import TORCHIEKF
 from utils import prepare_data
 import copy
+from typing import Tuple, List
 
 max_loss = 2e1
 max_grad_norm = 1e0
@@ -22,7 +23,20 @@ weight_decay_mesnet = {'cov_net': 1e-8,
     }
 
 
-def compute_delta_p(Rot, p):
+def compute_delta_p(Rot: torch.Tensor, p: torch.Tensor) -> List[list]:
+    """
+    Compute relative position error for trajectory evaluation.
+    
+    Args:
+        Rot: Rotation matrices with shape (N, 3, 3) where N is sequence length
+        p: Position vectors with shape (N, 3)
+    
+    Returns:
+        list_rpe: List containing [idx_0, idx_end, delta_p] where:
+            - idx_0: List of starting indices
+            - idx_end: List of ending indices
+            - delta_p: Tensor of relative positions with shape (len(idx_0), 3)
+    """
     list_rpe = [[], [], []]  # [idx_0, idx_end, pose_delta_p]
 
     # sample at 1 Hz
@@ -56,7 +70,14 @@ def compute_delta_p(Rot, p):
     return list_rpe
 
 
-def train_filter(args, dataset):
+def train_filter(args: object, dataset: object) -> None:
+    """
+    Train the IMU-based state estimator with deep learning components.
+    
+    Args:
+        args: Arguments containing training parameters and configurations
+        dataset: Dataset object containing IMU and ground truth data
+    """
     iekf = prepare_filter(args, dataset)
     prepare_loss_data(args, dataset)
     save_iekf(args, iekf)
@@ -70,7 +91,17 @@ def train_filter(args, dataset):
         start_time = time.time()
 
 
-def prepare_filter(args, dataset):
+def prepare_filter(args: object, dataset: object) -> TORCHIEKF:
+    """
+    Prepare the Invariant Extended Kalman Filter for training.
+    
+    Args:
+        args: Arguments containing filter parameters and configurations
+        dataset: Dataset object containing IMU and ground truth data
+        
+    Returns:
+        iekf: Initialized TORCHIEKF object ready for training
+    """
     iekf = TORCHIEKF()
 
     # set dataset parameter
@@ -88,12 +119,23 @@ def prepare_filter(args, dataset):
     return iekf
 
 
-def prepare_loss_data(args, dataset):
+def prepare_loss_data(args: object, dataset: object) -> None:
+    """
+    Prepare relative pose error data for computing training loss.
+    
+    Args:
+        args: Arguments containing parameters and configurations
+        dataset: Dataset object containing IMU and ground truth data
+        
+    Note:
+        Modifies dataset in-place to add list_rpe and list_rpe_validation
+    """
 
 
 
     file_delta_p = os.path.join(args.path_temp, 'delta_p.p')
     if os.path.isfile(file_delta_p):
+        print("Loading loss data from {}".format(file_delta_p))
         mondict = dataset.load(file_delta_p)
         dataset.list_rpe = mondict['list_rpe']
         dataset.list_rpe_validation = mondict['list_rpe_validation']
@@ -103,7 +145,10 @@ def prepare_loss_data(args, dataset):
     # prepare delta_p_gt
     list_rpe = {}
     for dataset_name, Ns in dataset.datasets_train_filter.items():
+        print("Preparing loss data for {}, {}".format(dataset_name, Ns))
         t, ang_gt, p_gt, v_gt, u = prepare_data(args, dataset, dataset_name, 0)
+        if Ns[1] is None:
+            Ns[1] = t.shape[0]
         p_gt = p_gt.double()
         Rot_gt = torch.zeros(Ns[1], 3, 3)
         for k in range(Ns[1]):
@@ -146,7 +191,21 @@ def prepare_loss_data(args, dataset):
     dataset.dump(mondict, file_delta_p)
 
 
-def train_loop(args, dataset, epoch, iekf, optimizer, seq_dim):
+def train_loop(args: object, dataset: object, epoch: int, iekf: TORCHIEKF, optimizer: torch.optim.Optimizer, seq_dim: int) -> torch.Tensor:
+    """
+    Perform one training epoch over all training datasets.
+    
+    Args:
+        args: Arguments containing training parameters
+        dataset: Dataset object containing IMU and ground truth data
+        epoch: Current epoch number
+        iekf: The TORCHIEKF model to train
+        optimizer: Optimizer for model parameters
+        seq_dim: Sequence length for training samples
+        
+    Returns:
+        loss_train: Training loss for the epoch (scalar tensor)
+    """
     loss_train = 0
     optimizer.zero_grad()
     for i, (dataset_name, Ns) in enumerate(dataset.datasets_train_filter.items()):
@@ -182,13 +241,40 @@ def train_loop(args, dataset, epoch, iekf, optimizer, seq_dim):
     return loss_train
 
 
-def save_iekf(args, iekf):
+def save_iekf(args: object, iekf: TORCHIEKF) -> None:
+    """
+    Save the trained IEKF model parameters.
+    
+    Args:
+        args: Arguments containing path information
+        iekf: The TORCHIEKF model to save
+    """
     file_name = os.path.join(args.path_temp, "iekfnets.p")
     torch.save(iekf.state_dict(), file_name)
     print("The IEKF nets are saved in the file " + file_name)
 
 
-def mini_batch_step(dataset, dataset_name, iekf, list_rpe, t, ang_gt, p_gt, v_gt, u, N0):
+def mini_batch_step(dataset: object, dataset_name: str, iekf: TORCHIEKF, list_rpe: list, 
+                  t: torch.Tensor, ang_gt: torch.Tensor, p_gt: torch.Tensor, 
+                  v_gt: torch.Tensor, u: torch.Tensor, N0: int) -> torch.Tensor:
+    """
+    Perform one mini-batch training step.
+    
+    Args:
+        dataset: Dataset object containing IMU and ground truth data
+        dataset_name: Name of the current dataset
+        iekf: The TORCHIEKF model to train
+        list_rpe: List of relative pose errors
+        t: Time vector with shape (N,)
+        ang_gt: Ground truth angles with shape (N, 3)
+        p_gt: Ground truth positions with shape (N, 3)
+        v_gt: Ground truth velocities with shape (N, 3)
+        u: IMU measurements with shape (N, 6) [gyro_x, gyro_y, gyro_z, acc_x, acc_y, acc_z]
+        N0: Starting index in the sequence
+        
+    Returns:
+        loss: Loss value for this mini-batch (scalar tensor) or -1 if invalid
+    """
     iekf.set_Q()
     measurements_covs = iekf.forward_nets(u)
     Rot, v, p, b_omega, b_acc, Rot_c_i, t_c_i = iekf.run(t, u,measurements_covs,
@@ -201,7 +287,16 @@ def mini_batch_step(dataset, dataset_name, iekf, list_rpe, t, ang_gt, p_gt, v_gt
     return loss
 
 
-def set_optimizer(iekf):
+def set_optimizer(iekf: TORCHIEKF) -> torch.optim.Optimizer:
+    """
+    Set up the optimizer for training the IEKF network components.
+    
+    Args:
+        iekf: The TORCHIEKF model whose parameters will be optimized
+        
+    Returns:
+        optimizer: Adam optimizer configured with appropriate parameters
+    """
     param_list = [{'params': iekf.initprocesscov_net.parameters(),
                            'lr': lr_initprocesscov_net,
                            'weight_decay': weight_decay_initprocesscov_net}]
@@ -214,7 +309,26 @@ def set_optimizer(iekf):
     return optimizer
 
 
-def prepare_data_filter(dataset, dataset_name, Ns, iekf, seq_dim):
+def prepare_data_filter(dataset: object, dataset_name: str, Ns: list, 
+                         iekf: TORCHIEKF, seq_dim: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """
+    Prepare data for filter training by extracting, subsampling, and processing sensor data.
+    
+    Args:
+        dataset: Dataset object containing IMU and ground truth data
+        dataset_name: Name of the current dataset
+        Ns: List containing [start_idx, end_idx] for the sequence
+        iekf: The TORCHIEKF model (used to check training mode)
+        seq_dim: Sequence length for training samples
+        
+    Returns:
+        t: Time vector with shape (seq_length,)
+        ang_gt: Ground truth angles with shape (seq_length, 3)
+        p_gt: Ground truth positions with shape (seq_length, 3)
+        v_gt: Ground truth velocities with shape (seq_length, 3)
+        u: IMU measurements with shape (seq_length, 6) [gyro_x, gyro_y, gyro_z, acc_x, acc_y, acc_z]
+        N0: Starting index in the sequence
+    """
     # get data with trainable instant
     t, ang_gt, p_gt, v_gt,  u = dataset.get_data(dataset_name)
     t = t[Ns[0]: Ns[1]]
@@ -238,7 +352,18 @@ def prepare_data_filter(dataset, dataset_name, Ns, iekf, seq_dim):
     return t, ang_gt, p_gt, v_gt, u, N0
 
 
-def get_start_and_end(seq_dim, u):
+def get_start_and_end(seq_dim: int, u: torch.Tensor) -> Tuple[int, int]:
+    """
+    Determine start and end indices for a training sequence.
+    
+    Args:
+        seq_dim: Desired sequence length, or None to use full sequence
+        u: IMU measurements tensor with shape (N, 6)
+        
+    Returns:
+        N0: Start index
+        N: End index
+    """
     if seq_dim is None:
         N0 = 0
         N = u.shape[0]
@@ -248,7 +373,21 @@ def get_start_and_end(seq_dim, u):
     return N0, N
 
 
-def precompute_lost(Rot, p, list_rpe, N0):
+def precompute_lost(Rot: torch.Tensor, p: torch.Tensor, list_rpe: list, N0: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Precompute loss terms for relative pose error evaluation.
+    
+    Args:
+        Rot: Rotation matrices with shape (N, 3, 3)
+        p: Position vectors with shape (N, 3)
+        list_rpe: List containing relative pose error information [idx_0, idx_end, delta_p_gt]
+        N0: Starting index in the sequence
+        
+    Returns:
+        delta_p: Normalized estimated relative positions with shape (num_valid_samples, 3)
+        delta_p_gt: Normalized ground truth relative positions with shape (num_valid_samples, 3)
+        or (None, None) if no valid samples are found
+    """
     N = p.shape[0]
     Rot_10_Hz = Rot[::10]
     p_10_Hz = p[::10]

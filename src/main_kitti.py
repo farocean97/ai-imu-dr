@@ -437,7 +437,13 @@ def test_filter(args, dataset):
                                                        to_numpy=True)
         N = None
         u_t = torch.from_numpy(u).double()
+        print("u_t shape: ", u_t.shape)
+        print("ang_gt shape: ", ang_gt.shape)
+        print("p_gt shape: ", p_gt.shape)
+        print("v_gt shape: ", v_gt.shape)
+        print("t shape: ", t.shape)
         measurements_covs = torch_iekf.forward_nets(u_t)
+        print("measurements_covs shape: ", measurements_covs.shape)
         measurements_covs = measurements_covs.detach().numpy()
         start_time = time.time()
         Rot, v, p, b_omega, b_acc, Rot_c_i, t_c_i = iekf.run(t, u, measurements_covs,
@@ -470,8 +476,8 @@ class KITTIArgs():
 
         # choose what to do
         read_data = 0
-        train_filter = 0
-        test_filter = 1
+        train_filter = 1
+        test_filter = 0
         results_filter = 1
         dataset_class = KITTIDataset
         parameter_class = KITTIParameters

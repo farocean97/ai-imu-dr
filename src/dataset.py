@@ -63,6 +63,7 @@ class BaseDataset(Dataset):
     def get_datasets(self):
         for dataset in os.listdir(self.path_data_save):
             self.datasets += [dataset[:-2]]  # take just name, remove the ".p"
+        print('... found datasets: ' + str(self.datasets))
         self.divide_datasets()
 
     def divide_datasets(self):
