@@ -60,14 +60,16 @@ def get_data_paths(base_dir):
     for folder in base_path.iterdir():
         if folder.is_dir():
             folder_name = folder.name
+            print (f"Checking folder: {folder_name}")
 
             # slam_pose = folder / 'twomap_ws' / 'graphs' / 'scan_matching' / 'step_1' / 'optimized' / 'vehicle_pose_nodes.parquet'
             # odometry = folder / 'twomap_ws' / 'sensor_data' / folder_name / 'odometry.parquet'
-
-            imu = folder / f'{folder_name}_imu.parquet'
-            wheel_speed = folder / f'{folder_name}_wheel_speed.parquet'
-            calibration = folder / f'{folder_name}_calibration.json'
-            interpolated_pose = folder / 'twomap_ws' / 'sensor_data' / folder_name / 'interpolated_pose.parquet'
+            inputs_dir = folder / 'inputs'
+            labels_dir = folder / 'labels'
+            imu = inputs_dir / f'imu.parquet'
+            wheel_speed = inputs_dir / f'wheels.parquet'
+            calibration = inputs_dir / f'calibration.json'
+            interpolated_pose = labels_dir / f'interpolated_pose.parquet'
 
             if imu.exists() and wheel_speed.exists() and calibration.exists() and interpolated_pose.exists():
                 data_paths[folder_name] = {
@@ -97,12 +99,14 @@ def read_p4h_data(data_paths):
     imu_df = imu_df.sort_values('timestamp_ns')
     wheel_speed_df = wheel_speed_df.sort_values('timestamp_ns')
     interpolated_pose_df = interpolated_pose_df.sort_values('timestamp_ns')
+    print(interpolated_pose_df.columns)
 
     with open(calibration_path, 'r') as file:
         calibration_json = json.load(file)
 
     threshold_mph = 100
-    timestamp_cutoff = find_cutoff_timestamp(interpolated_pose_df, threshold_mph)
+    #timestamp_cutoff = find_cutoff_timestamp(interpolated_pose_df, threshold_mph)
+    timestamp_cutoff = None  # Disable cutoff for now
 
     if timestamp_cutoff is not None:
         # print(f"Large jump detected at timestamp: {timestamp_cutoff:.0f}")
@@ -119,12 +123,16 @@ def prepare_p4h_data(data_paths):
     """
     # Read the data from the paths
     imu_df, wheel_speed_df, calibration_json, interpolated_pose_df = read_p4h_data(data_paths)
+    print(interpolated_pose_df.columns)
+    print(imu_df.columns)
+    print(wheel_speed_df.columns)
+    print(wheel_speed_df.head())
 
     # Processing IMU data
     imu_df = imu_df.iloc[::10].reset_index(drop=True) # Downsample IMU data
     # imu_df = imu_df.iloc[:20000]
-    gyro_data = imu_df[['gyro_x_radps', 'gyro_y_radps', 'gyro_z_radps']].values
-    acc_data = imu_df[['acc_x_mpss', 'acc_y_mpss', 'acc_z_mpss']].values
+    gyro_data = imu_df[['w_RS_x', 'w_RS_y', 'w_RS_z']].values
+    acc_data = imu_df[['a_RS_R_x', 'a_RS_R_y', 'a_RS_R_z']].values
     u = np.concatenate((gyro_data, acc_data), axis=1)
 
     imu_timestamps_ns = imu_df['timestamp_ns'].values
@@ -132,42 +140,54 @@ def prepare_p4h_data(data_paths):
 
     # Processing Wheel Speed data
     P4A_WHEEL_RADIUS = 0.36  # Define the wheel radius in meters
-    wheel_speed_df['rear_left_speed_mps'] = wheel_speed_df['rear_left_speed_radps'] * P4A_WHEEL_RADIUS
-    wheel_speed_df['rear_right_speed_mps'] = wheel_speed_df['rear_right_speed_radps'] * P4A_WHEEL_RADIUS
-    wheel_speed_df['vehicle_mps'] = wheel_speed_df[['rear_left_speed_mps',
-                                                       'rear_right_speed_mps']].mean(axis=1)
+    # wheel_speed_df['rear_left_speed_mps'] = wheel_speed_df['rear_left_speed'] * P4A_WHEEL_RADIUS
+    # wheel_speed_df['rear_right_speed_mps'] = wheel_speed_df['rear_right_speed'] * P4A_WHEEL_RADIUS
+    wheel_speed_df['vehicle_mps'] = wheel_speed_df[['rear_left_speed',
+                                                       'rear_right_speed']].mean(axis=1)
 
     vehicle_speed = wheel_speed_df['vehicle_mps'].values
     v = np.zeros((vehicle_speed.shape[0], 3))
     v[:, 0] = vehicle_speed  # x component
     # vehicle_speed_ts = wheel_speed_df['timestamp_ns'].values
 
+
+
     # Processing Interpolated Pose data
-    # Create np.array T_EV
-    T_EV_columns = [
-        'pose_00', 'pose_01', 'pose_02', 'pose_03',
-        'pose_10', 'pose_11', 'pose_12', 'pose_13',
-        'pose_20', 'pose_21', 'pose_22', 'pose_23',
-        'pose_30', 'pose_31', 'pose_32', 'pose_33'
-    ]
-    T_EV = interpolated_pose_df[T_EV_columns].values
-    T_EV = T_EV.reshape((T_EV.shape[0], 4, 4))
+    # Extract position and quaternion data
+    position_columns = ['p_EV_E_x', 'p_EV_E_y', 'p_EV_E_z']
+    quaternion_columns = ['quat_EV_w', 'quat_EV_x', 'quat_EV_y', 'quat_EV_z']
+    
+    # Get position and quaternion data
+    positions = interpolated_pose_df[position_columns].values  # (N, 3)
+    quaternions = interpolated_pose_df[quaternion_columns].values  # (N, 4) - [w, x, y, z]
+    
+    # Convert quaternions to rotation matrices
+    rotations = R.from_quat(quaternions[:, [1, 2, 3, 0]]).as_matrix()  # scipy expects [x, y, z, w]
+    
+    # Create transformation matrices T_EV
+    N = len(interpolated_pose_df)
+    T_EV = np.zeros((N, 4, 4))
+    T_EV[:, :3, :3] = rotations  # Rotation part
+    T_EV[:, :3, 3] = positions   # Translation part
+    T_EV[:, 3, 3] = 1           # Homogeneous coordinate
+    
     T_EV_ts = interpolated_pose_df['timestamp_ns'].values
     T_EV_ts = (T_EV_ts - T_EV_ts[0]) / 1e9  # Convert to seconds from start
 
     # Getting Car -> IMU transformation from calibration
     T_VI = np.eye(4)
     imu_pose = calibration_json["inertialNavSystems"][0]["pose"]
+    
     T_VI[:3, :3] = np.array([
         imu_pose['rotation']['row1'],
         imu_pose['rotation']['row2'],
         imu_pose['rotation']['row3']
-    ])
-    T_VI[:3, 3] = np.array([
-        imu_pose['translation']['x'],
-        imu_pose['translation']['y'],
-        imu_pose['translation']['z']
-    ])
+    ]).T
+    # T_VI[:3, 3] = np.array([
+    #     imu_pose['translation']['x'],
+    #     imu_pose['translation']['y'],
+    #     imu_pose['translation']['z']
+    # ])
 
     T_VI_rpy = rot_to_rpy(T_VI[:3, :3])
     print(f"T_VI RPY (degrees): {[f'{x:.2f}' for x in T_VI_rpy]}")
@@ -488,6 +508,75 @@ def plot_imu_frame_velocity(v, t, experience_name):
     plt.close()
 
 
+def plot_imu_time_series(t, u, experience_name):
+    """
+    Plot IMU time series data including gyroscope and accelerometer measurements.
+    
+    Args:
+        t (np.ndarray): Time array in seconds
+        u (np.ndarray): IMU data array with shape (N, 6) containing [gyro_x, gyro_y, gyro_z, acc_x, acc_y, acc_z]
+        experience_name (str): Name of the experience for file naming
+    """
+    os.makedirs('./iekf_imu_time_series/', exist_ok=True)
+    
+    # Extract gyroscope and accelerometer data
+    gyro_data = u[:, :3]  # First 3 columns: gyroscope
+    acc_data = u[:, 3:]   # Last 3 columns: accelerometer
+    
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # Gyroscope data - separate components
+    axes[0, 0].plot(t, gyro_data[:, 0], 'r-', label="Gyro X", linewidth=1)
+    axes[0, 0].plot(t, gyro_data[:, 1], 'g-', label="Gyro Y", linewidth=1)
+    axes[0, 0].plot(t, gyro_data[:, 2], 'b-', label="Gyro Z", linewidth=1)
+    axes[0, 0].set_xlabel('Time (s)')
+    axes[0, 0].set_ylabel('Angular Velocity (rad/s)')
+    axes[0, 0].set_title('Gyroscope Data - Time Series')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True)
+    
+    # Accelerometer data - separate components
+    axes[0, 1].plot(t, acc_data[:, 0], 'r-', label="Acc X", linewidth=1)
+    axes[0, 1].plot(t, acc_data[:, 1], 'g-', label="Acc Y", linewidth=1)
+    axes[0, 1].plot(t, acc_data[:, 2], 'b-', label="Acc Z", linewidth=1)
+    axes[0, 1].set_xlabel('Time (s)')
+    axes[0, 1].set_ylabel('Acceleration (m/s²)')
+    axes[0, 1].set_title('Accelerometer Data - Time Series')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True)
+    
+    # Gyroscope magnitude
+    gyro_magnitude = np.linalg.norm(gyro_data, axis=1)
+    axes[1, 0].plot(t, gyro_magnitude, 'k-', label="Gyro Magnitude", linewidth=2)
+    axes[1, 0].set_xlabel('Time (s)')
+    axes[1, 0].set_ylabel('Angular Velocity Magnitude (rad/s)')
+    axes[1, 0].set_title('Gyroscope Magnitude - Time Series')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True)
+    
+    # Accelerometer magnitude
+    acc_magnitude = np.linalg.norm(acc_data, axis=1)
+    axes[1, 1].plot(t, acc_magnitude, 'k-', label="Acc Magnitude", linewidth=2)
+    axes[1, 1].axhline(y=9.81, color='r', linestyle='--', alpha=0.7, label="1g (9.81 m/s²)")
+    axes[1, 1].set_xlabel('Time (s)')
+    axes[1, 1].set_ylabel('Acceleration Magnitude (m/s²)')
+    axes[1, 1].set_title('Accelerometer Magnitude - Time Series')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True)
+    
+    plt.tight_layout()
+    plt.savefig(f'./iekf_imu_time_series/{experience_name}_imu_time_series.png')
+    plt.close()
+
+def read_motion_states(motion_states_file):
+    motion_states_df = pd.read_parquet(motion_states_file)
+    t = (motion_states_df['timestamp'].values - motion_states_df['timestamp'].values[0]) / 1e9
+    u = motion_states_df[['imu_signal_roll', 'imu_signal_pitch', 'imu_signal_yaw', 'imu_signal_gx', 'imu_signal_gy', 'imu_signal_gz']].values
+    v = np.zeros((motion_states_df.shape[0], 3))
+    v[:, 0] = (motion_states_df['fl_e_rr_whlspd'].values + motion_states_df['fl_e_rl_whlspd'].values) /2.0
+    return t, u, v
+
+
 def test_filter(args, dataset, data_paths):
     iekf = IEKF()
     torch_iekf = TORCHIEKF()
@@ -501,13 +590,20 @@ def test_filter(args, dataset, data_paths):
     torch_iekf.load(args, dataset)
     iekf.set_learned_covariance(torch_iekf)
 
+    print(f"iekf cov diagonal elements: {np.diag(iekf.Q)}")
+
     t, u, v, T_EV_ts, T_EV, T_VI = prepare_p4h_data(data_paths)
+    t,u,v = read_motion_states(motion_states_file='/home/ubuntu/tmp/odometry/ip610_D_20251024_181731_d009-AVRD_20203/parquet/all_speed_ego_motion_perception_inputs.parquet')   
+
+    plot_imu_time_series(t, u, data_paths['experience_name'])
+
     N, p = t.shape[0], None
+    print(f"cov_lat: {iekf.cov_lat}, cov_up: {iekf.cov_up}")
     measurements_covs = np.tile(np.array([iekf.cov_lat, iekf.cov_up], dtype=np.float64), (N, 1))
     ang = np.zeros(3)  # Assuming Identity orientation
 
     R_LV = np.eye(3)
-    R_LI, p_LI_L, v_LI_L = initialize_state(np.linalg.inv(T_VI[:3, :3]), T_VI[:3, 3], R_LV, v[0, 0], u[0, :3])
+    R_LI, p_LI_L, v_LI_L = initialize_state(T_VI[:3, :3], T_VI[:3, 3], R_LV, v[0, 0], u[0, :3])
     p4h_params = {'T_VI': T_VI,
                   'R_LI': R_LI,
                   'p_LI_L': p_LI_L,
@@ -521,11 +617,23 @@ def test_filter(args, dataset, data_paths):
     # Transforming T_EV to start from identity
     T_EV = np.linalg.inv(T_EV[0]) @ T_EV
 
+    T_IV = np.zeros((Rot_c_i.shape[0], 4, 4))
+    T_IV[:, :3, :3] = Rot_c_i
+    T_IV[:, :3, 3] = t_c_i
+    T_IV[:, 3, 3] = 1
+
+    T_LI = np.zeros((Rot.shape[0], 4, 4))
+    T_LI[:, :3, :3] = Rot
+    T_LI[:, :3, 3] = p
+    T_LI[:, 3, 3] = 1
+    T_LV = np.einsum('nij,njk->nik', T_LI, T_IV)
+    T_LV = np.linalg.inv(T_LV[0]) @ T_LV
+
     os.makedirs('./iekf_xy_trajectories/', exist_ok=True)
 
     # Plotting TwoMap interpolated trajectory and IEKF trajectory
     fig, ax0 = plt.subplots(1, 1, figsize=(5, 5))
-    ax0.plot(p[:, 0], p[:, 1], label="IEKF")
+    ax0.plot(T_LV[:, 0], T_LV[:, 1], label="IEKF")
     ax0.plot(T_EV[:, 0, 3], T_EV[:, 1, 3], label="TwoMap interpolated pose")
     ax0.legend()
     ax0.set_xlabel('X')
@@ -541,9 +649,9 @@ def test_filter(args, dataset, data_paths):
     T_pred[:, :3, :3] = Rot
     T_pred[:, :3, 3] = p
     T_pred[:, 3, 3] = 1
-    plot_predicted_vs_ground_truth(t, T_pred, T_EV_ts, T_EV, data_paths['experience_name'])
+    plot_predicted_vs_ground_truth(t, T_LV, T_EV_ts, T_EV, data_paths['experience_name'])
 
-    v_pred = compute_velocity_from_pose(T_pred, t)
+    v_pred = compute_velocity_from_pose(T_LI, t)
     v_gt = compute_velocity_from_pose(T_EV, T_EV_ts)
     plot_local_frame_velocity(t, v_pred, T_EV_ts, v_gt, data_paths['experience_name'])
     
@@ -563,6 +671,8 @@ def test_filter(args, dataset, data_paths):
     T_VI[:, 3, 3] = 1
     plot_R_VI(t, T_VI, data_paths['experience_name'])
 
+    plot_imu_time_series(t, u, data_paths['experience_name'])
+
 
 if __name__ == "__main__":
     args = KITTIArgs()
@@ -575,7 +685,10 @@ if __name__ == "__main__":
     
     parsed_args = parser.parse_args()
     data_base_dir = parsed_args.data_base_dir.expanduser()
+    print(f"Data base directory: {data_base_dir}")
     data_paths = get_data_paths(data_base_dir)
+    print(f"Found {len(data_paths)} data folders to process.")
 
     for folder_name, data_paths in data_paths.items():
+        print(f"Processing folder: {folder_name}")
         test_filter(args, dataset, data_paths)
